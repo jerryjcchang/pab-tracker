@@ -2,16 +2,16 @@
 """Check whether LEGO Pick-a-Brick elements are in stock; push a notification via ntfy.sh
 only when one flips from out-of-stock to in-stock.
 
-LEGO renders Pick-a-Brick search results on the server and embeds schema.org JSON-LD in the
-page, including an `availability` field per product. We fetch the search page for each element
-ID and read that field.
+Uses the same GraphQL endpoint the Pick-a-Brick page itself calls
+(https://www.lego.com/api/graphql/PickABrickQuery). Each result has an `availability`
+field that is either "AVAILABLE" or "OUT_OF_STOCK".
 
 Env vars:
   PAB_ELEMENT_ID   required; one ID or several separated by commas/spaces,
                    e.g. "6615702" or "6615702, 300126, 4211399"
   NTFY_TOPIC       required, your private ntfy topic name
   PAB_LOCALE       optional, default "en-us"
-  DEBUG            optional, set to 1 to print the product data found
+  DEBUG            optional, set to 1 to print the item data found
 """
 import json
 import os
@@ -31,9 +31,18 @@ STATE_FILE = "state.json"
 DEBUG = os.environ.get("DEBUG") == "1"
 DELAY_SECONDS = 2  # pause between requests to be polite
 
-LD_JSON = re.compile(
-    r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', re.S | re.I
+API_URL = "https://www.lego.com/api/graphql/PickABrickQuery"
+QUERY = (
+    "query PickABrickQuery($input: ElementQueryInput!) { "
+    "searchElements(input: $input) { "
+    "results { id name availability maxOrderQuantity deliveryChannel "
+    "price { formattedAmount formattedValue } } total count } }"
 )
+
+
+def x_locale():
+    lang, _, region = LOCALE.partition("-")
+    return f"{lang}-{region.upper()}" if region else lang
 
 
 def page_url(element_id):
@@ -43,54 +52,59 @@ def page_url(element_id):
     )
 
 
-def fetch_html(element_id):
+def fetch_results(element_id):
+    body = {
+        "operationName": "PickABrickQuery",
+        "variables": {
+            "input": {
+                "page": 1,
+                "perPage": 50,
+                "sort": {"key": "RELEVANCE", "direction": "DESC"},
+                "availability": ["AVAILABLE", "OUT_OF_STOCK"],
+                "query": element_id,
+                "fetchSiblings": True,
+            }
+        },
+        "query": QUERY,
+    }
     req = urllib.request.Request(
-        page_url(element_id),
+        API_URL,
+        data=json.dumps(body).encode(),
         headers={
+            "Content-Type": "application/json",
+            "Accept": "*/*",
+            "x-locale": x_locale(),
+            "Origin": "https://www.lego.com",
+            "Referer": page_url(element_id),
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "en-US,en;q=0.9",
         },
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            return r.read().decode("utf-8", errors="replace")
+            data = json.load(r)
     except urllib.error.HTTPError as e:
         snippet = e.read(300).decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {e.code} from LEGO (possibly blocked): {snippet!r}")
+    if data.get("errors"):
+        raise RuntimeError(f"GraphQL errors: {json.dumps(data['errors'])[:300]}")
+    try:
+        return data["data"]["searchElements"]["results"]
+    except (KeyError, TypeError):
+        raise RuntimeError(f"Unexpected response shape: {json.dumps(data)[:300]}")
 
 
-def find_product(html, element_id):
-    """Return (product_dict_or_None, saw_item_list)."""
-    saw_list = False
-    for block in LD_JSON.findall(html):
-        try:
-            data = json.loads(block)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict) and data.get("@type") == "ItemList":
-            saw_list = True
-            for entry in data.get("itemListElement", []):
-                if str(entry.get("sku")) == element_id:
-                    return entry, saw_list
-    return None, saw_list
+def in_stock(item):
+    return bool(item) and item.get("availability") == "AVAILABLE"
 
 
-def in_stock(product):
-    if not product:
-        return False
-    availability = (product.get("offers") or {}).get("availability", "")
-    return availability.rsplit("/", 1)[-1] in ("InStock", "LimitedAvailability")
-
-
-def notify(element_id, product):
-    name = product.get("name", element_id)
-    price = (product.get("offers") or {}).get("price")
-    price_text = f"${price}" if price is not None else ""
+def notify(element_id, item):
+    name = item.get("name", element_id)
+    price = (item.get("price") or {}).get("formattedAmount", "")
+    message = " ".join(f"{name} {price} is back in stock on Pick-a-Brick!".split())
     req = urllib.request.Request(
         f"https://ntfy.sh/{NTFY_TOPIC}",
-        data=f"{name} {price_text} is back in stock on Pick-a-Brick!".replace("  ", " ").encode(),
+        data=message.encode(),
         headers={
             "Title": "LEGO restock",
             "Priority": "high",
@@ -111,51 +125,37 @@ def load_state():
     return {k: bool(v) for k, v in data.items() if k.isdigit()}
 
 
-def check_one(element_id):
-    """Return current in-stock bool. Raises if the page couldn't be read."""
-    html = fetch_html(element_id)
-    product, saw_list = find_product(html, element_id)
-
-    if not saw_list:
-        # No results block at all: likely a bot-challenge page or a layout change,
-        # not a genuine "out of stock". Fail loudly so state isn't overwritten.
-        title = re.search(r"<title>(.*?)</title>", html, re.S | re.I)
-        raise RuntimeError(
-            "Could not find product data on the page "
-            f"(title: {title.group(1).strip() if title else 'n/a'}, {len(html)} bytes). "
-            "LEGO may be blocking this request or the page layout changed."
-        )
+def check_one(element_id, state):
+    """Return current in-stock bool. Raises if the lookup failed."""
+    results = fetch_results(element_id)
+    item = next((r for r in results if str(r.get("id")) == element_id), None)
 
     if DEBUG:
-        print(f"[{element_id}] product:", json.dumps(product, indent=2))
-    if product is None:
+        print(f"[{element_id}] item:", json.dumps(item, indent=2))
+    if item is None:
         print(f"[{element_id}] not in results (treating as out of stock)")
 
-    now = in_stock(product)
-    was = STATE.get(element_id, False)
-    print(f"[{element_id}] {(product or {}).get('name', '?')}: in_stock={now} (previously {was})")
+    now = in_stock(item)
+    was = state.get(element_id, False)
+    print(f"[{element_id}] {(item or {}).get('name', '?')}: in_stock={now} (previously {was})")
     if now and not was:
-        notify(element_id, product)
+        notify(element_id, item)
         print(f"[{element_id}] notification sent")
     return now
 
 
-STATE = {}
-
-
 def main():
-    global STATE
     if not ELEMENT_IDS:
         raise SystemExit("PAB_ELEMENT_ID is empty")
-    STATE = load_state()
-    new_state = dict(STATE)  # failed checks keep their previous value
+    state = load_state()
+    new_state = dict(state)  # failed checks keep their previous value
     failures = []
 
     for n, element_id in enumerate(ELEMENT_IDS):
         if n:
             time.sleep(DELAY_SECONDS)
         try:
-            new_state[element_id] = check_one(element_id)
+            new_state[element_id] = check_one(element_id, state)
         except Exception as e:
             failures.append(element_id)
             print(f"[{element_id}] check failed: {e}", file=sys.stderr)
@@ -166,7 +166,10 @@ def main():
         json.dump(new_state, f, indent=2, sort_keys=True)
 
     if failures:
-        print(f"{len(failures)} of {len(ELEMENT_IDS)} checks failed: {', '.join(failures)}", file=sys.stderr)
+        print(
+            f"{len(failures)} of {len(ELEMENT_IDS)} checks failed: {', '.join(failures)}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 
